@@ -1,4 +1,7 @@
 from __future__ import absolute_import
+
+from typing import Union, Type
+
 import torch
 import numpy as np
 import copy
@@ -76,14 +79,24 @@ class BaseMultiTaskModel(BaseModel):
 
     * `auto_scaler`: **boolean** *(default=True)* -- 
         Determines whether a sklearn scaler should be automatically applied
+
+    * `dtype`: **str or `torch.dtype`** *(default=`torch.float32`)* --
+        Sets the expected exact data-type of the model. Allows alleviating numerical overflow
     """
 
-    def __init__(self, structure, bins=100, auto_scaler=True):
+    def __init__(self, structure, bins=100, auto_scaler=True, dtype: Union[str, torch.dtype] = torch.float32):
 
         # Saving the attributes
         self.loss_values = []
         self.bins = bins
         self.structure = structure
+
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype)
+
+        if not isinstance(dtype, torch.dtype):
+            raise TypeError(type(dtype))
+        self.dtype = dtype
 
         # Initializing the elements from BaseModel
         super(BaseMultiTaskModel, self).__init__(auto_scaler)
@@ -145,10 +158,10 @@ class BaseMultiTaskModel(BaseModel):
                 Y_cens.append(y.tolist())
 
         # Transform into torch.Tensor
-        X_cens = torch.FloatTensor(X_cens)
-        X_uncens = torch.FloatTensor(X_uncens)
-        Y_cens = torch.FloatTensor(Y_cens)
-        Y_uncens = torch.FloatTensor(Y_uncens)
+        X_cens = torch.tensor(X_cens, dtype=self.dtype)
+        X_uncens = torch.tensor(X_uncens, dtype=self.dtype)
+        Y_cens = torch.tensor(Y_cens, dtype=self.dtype)
+        Y_uncens = torch.tensor(Y_uncens, dtype=self.dtype)
 
         return X_cens, X_uncens, Y_cens, Y_uncens
 
@@ -160,25 +173,25 @@ class BaseMultiTaskModel(BaseModel):
 
         # Likelihood Calculations -- Uncensored
         score_uncens = model(X_uncens)
-        phi_uncens = torch.exp(torch.mm(score_uncens, Triangle))
-        reduc_phi_uncens = torch.sum(phi_uncens * Y_uncens, dim=1)
+        log_phi_uncens = torch.mm(score_uncens, Triangle)
+        log_reduc_phi_uncens = torch.logsumexp(log_phi_uncens + torch.log(Y_uncens), dim=1)
 
         # Likelihood Calculations -- Censored
         score_cens = model(X_cens)
-        phi_cens = torch.exp(torch.mm(score_cens, Triangle))
-        reduc_phi_cens = torch.sum(phi_cens * Y_cens, dim=1)
+        log_phi_cens = torch.mm(score_cens, Triangle)
+        log_reduc_phi_cens = torch.logsumexp(log_phi_cens + torch.log(Y_cens), dim=1)
 
         # Likelihood Calculations -- Normalization
-        z_uncens = torch.exp(torch.mm(score_uncens, Triangle))
-        reduc_z_uncens = torch.sum(z_uncens, dim=1)
+        log_z_uncens = torch.mm(score_uncens, Triangle)
+        log_reduc_z_uncens = torch.logsumexp(log_z_uncens, dim=1)
 
-        z_cens = torch.exp(torch.mm(score_cens, Triangle))
-        reduc_z_cens = torch.sum(z_cens, dim=1)
+        log_z_cens = torch.mm(score_cens, Triangle)
+        log_reduc_z_cens = torch.logsumexp(log_z_cens, dim=1)
 
         # MTLR cost function
         loss = - (
-                torch.sum(torch.log(reduc_phi_uncens)) + torch.sum(torch.log(reduc_phi_cens)) - torch.sum(
-            torch.log(reduc_z_uncens)) - torch.sum(torch.log(reduc_z_cens))
+                torch.sum(log_reduc_phi_uncens) + torch.sum(log_reduc_phi_cens)
+                - torch.sum(log_reduc_z_uncens)- torch.sum(log_reduc_z_cens)
         )
 
         # Adding the regularized loss
@@ -192,7 +205,7 @@ class BaseMultiTaskModel(BaseModel):
         return loss
 
     def fit(self, X, T, E, init_method='glorot_uniform', optimizer='adam',
-            lr=1e-4, num_epochs=1000, dropout=None, l2_reg=1e-2,
+            lr=1e-4, num_epochs=1000, dropout=0.2, l2_reg=1e-2,
             l2_smooth=1e-2, batch_normalization=False, bn_and_dropout=False,
             verbose=True, extra_pct_time=0.1, is_min_time_zero=True):
         """ Fit the estimator based on the given parameters.
@@ -355,10 +368,11 @@ class BaseMultiTaskModel(BaseModel):
         model = nn.NeuralNet(input_shape, self.num_times, self.structure,
                              init_method, dropout, batch_normalization,
                              bn_and_dropout)
+        model.to(dtype=self.dtype)
 
         # Creating the Triangular matrix
         Triangle = np.tri(self.num_times, self.num_times + 1, dtype=np.float32)
-        Triangle = torch.FloatTensor(Triangle)
+        Triangle = torch.tensor(Triangle, dtype=self.dtype)
 
         # Performing order 1 optimization
         model, loss_values = opt.optimize(self.loss_function, model, optimizer,
@@ -402,13 +416,13 @@ class BaseMultiTaskModel(BaseModel):
                 x = np.reshape(x, (1, -1))
 
         # Transforming into pytorch objects
-        x = torch.FloatTensor(x)
+        x = torch.tensor(x, dtype=self.dtype)
 
         # Predicting using linear/nonlinear function
         score_torch = self.model(x)
         score = score_torch.data.numpy()
 
-        # Cretaing the time triangles
+        # Creating the time triangles
         Triangle1 = np.tri(self.num_times, self.num_times + 1)
         Triangle2 = np.tri(self.num_times + 1, self.num_times + 1)
 
@@ -471,9 +485,9 @@ class LinearMultiTaskModel(BaseMultiTaskModel):
 
     """
 
-    def __init__(self, bins=100, auto_scaler=True):
+    def __init__(self, bins=100, auto_scaler=True, dtype=torch.float32):
         super(LinearMultiTaskModel, self).__init__(
-            structure=None, bins=bins, auto_scaler=auto_scaler)
+            structure=None, bins=bins, auto_scaler=auto_scaler, dtype=dtype)
 
     def fit(self, X, T, E, init_method='glorot_uniform', optimizer='adam',
             lr=1e-4, num_epochs=1000, dropout=0.2, l2_reg=1e-2,
